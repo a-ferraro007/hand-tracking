@@ -1,6 +1,9 @@
 import "./style.css";
 import { loadOpenCv } from "./lib/opencv";
 import { createHandLandmarker } from "./lib/handLandmarker";
+import { createObjectDetector } from "./lib/objectDetector";
+import type { Detection } from "@mediapipe/tasks-vision";
+
 const M = 12;
 const THRESHOLD = 25;
 
@@ -90,19 +93,42 @@ function drawHands(
   }
 }
 
+function drawObjectDetection(
+  objects: Detection[],
+  ctx: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+) {
+  ctx.font = "15px Arial";
+  ctx.strokeStyle = "black";
+  ctx.fillStyle = "black";
+  for (const obj of objects) {
+    console.log(obj);
+    if (!obj) continue;
+    const { originX, originY, width, height } = obj.boundingBox;
+    ctx.fillText(
+      `${obj.categories[0].categoryName} ${obj.categories[0].score}`,
+      originX,
+      originY - 10,
+    );
+    ctx.strokeRect(originX, originY, width, height);
+  }
+}
+
 // index = (y * cols + x) * channels + c   // gray scale formula   // c: 0=R, 1=G, 2=B, 3=A gray
 async function main() {
   const cv = await loadOpenCv();
   const handLandmarker = await createHandLandmarker();
+  const objectDetector = await createObjectDetector();
   const canvas = document.getElementById("canvas") as HTMLCanvasElement;
   const video = document.getElementById("video") as HTMLVideoElement;
   const ctx = canvas.getContext("2d");
   const pointingAt = document.getElementById("pointing");
-
-  let touchLoc: Region;
+  let tick = 0;
 
   if (!ctx || !video) return;
+  let touchLoc: Region;
   await startWebcam(video);
+
   video.addEventListener("loadedmetadata", (event) => {
     ctx.canvas.height = video.videoHeight;
     ctx.canvas.width = video.videoWidth;
@@ -129,11 +155,11 @@ async function main() {
 
   canvas.addEventListener("mousemove", (evt) => {});
 
+  let objects: Detection[] = [];
   const render = () => {
     ctx.drawImage(video, 0, 0);
     let src = cv.imread("canvas"); // turn imageData into a Mat
     let gray = new cv.Mat(); // empty Mat for for the result
-
     const fingers: {
       tip: { x: number; y: number };
       joint: { x: number; y: number };
@@ -142,13 +168,25 @@ async function main() {
     try {
       // cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY); // writes into gray
       // cv.imshow(canvas, gray); // draws gray onto canvas
-
+      if (tick % 5 === 0) {
+        const tmp: Detection[] = [];
+        const objectDetection = objectDetector.detectForVideo(
+          video,
+          performance.now(),
+        );
+        for (const obj of objectDetection.detections) {
+          if (obj.categories[0].score < 0.5) continue;
+          tmp.push(obj);
+        }
+        objects = [...tmp];
+      }
+      drawObjectDetection(objects, ctx, canvas);
       const handDetection = handLandmarker.detectForVideo(
         video,
         performance.now(),
       );
-      ctx.fillStyle = "yellow";
 
+      ctx.fillStyle = "yellow";
       for (const hand of handDetection.landmarks) {
         const x = hand[8].x * canvas.width;
         const y = hand[8].y * canvas.height;
@@ -160,9 +198,10 @@ async function main() {
       }
 
       for (const r of regions) {
+        let shadowCount = 0;
+        const values: number[] = [];
         const outer = toOuterRegion(r);
         let imageData = ctx.getImageData(outer.x, outer.y, outer.w, outer.h);
-        const values: number[] = [];
 
         for (let px = 0; px < outer.w; px++) {
           for (let py = 0; py < outer.h; py++) {
@@ -173,11 +212,9 @@ async function main() {
           }
         }
 
-        if (fingers.some(({ tip, joint }) => !isOutside(tip, outer)))
+        if (fingers.some(({ tip }) => !isOutside(tip, outer)))
           r.baseline = getMedian(values);
         const cutoff = (r.baseline ?? getMedian(values)) * 0.8;
-        console.log({ cutoff });
-        let shadowCount = 0;
 
         for (const finger of fingers) {
           const { tip, joint } = finger;
@@ -204,9 +241,7 @@ async function main() {
         ctx.font = "20px Arial";
         ctx.fillStyle = "black";
         ctx.fillText(`${shadowCount}`, r.x, r.y - 10);
-        const inside = fingers.some(
-          ({ tip: { x, y }, joint: { x: jx, y: jy } }) => isInside({ x, y }, r),
-        );
+        const inside = fingers.some(({ tip }) => isInside(tip, r));
         if (inside) {
           ctx.strokeStyle = "green";
         } else ctx.strokeStyle = "red";
@@ -225,6 +260,7 @@ async function main() {
       gray.delete();
       if (pointingAt)
         pointingAt.textContent = `Pointing at: ${JSON.stringify(touchLoc) ?? ""}`;
+      tick++;
       requestAnimationFrame(render);
     }
   };
