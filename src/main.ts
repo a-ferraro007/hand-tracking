@@ -2,10 +2,11 @@ import "./style.css";
 import { loadOpenCv } from "./lib/opencv";
 import { createHandLandmarker } from "./lib/handLandmarker";
 import { createObjectDetector } from "./lib/objectDetector";
-import type { Detection } from "@mediapipe/tasks-vision";
+import type { Detection, NormalizedLandmark } from "@mediapipe/tasks-vision";
 
 const M = 12;
 const THRESHOLD = 25;
+const STEP = 2;
 
 type Region = {
   x: number;
@@ -14,6 +15,12 @@ type Region = {
   h: number;
   touching: boolean;
   baseline?: number;
+};
+
+type Finger = {
+  tip: { x: number; y: number };
+  joint: { x: number; y: number };
+  knuckle: { x: number; y: number };
 };
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
@@ -78,7 +85,7 @@ function getMedian(arr: number[]) {
     : sorted[mid];
 }
 
-function drawHands(
+function drawHand(
   hand: any,
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
@@ -102,16 +109,130 @@ function drawObjectDetection(
   ctx.strokeStyle = "black";
   ctx.fillStyle = "black";
   for (const obj of objects) {
-    console.log(obj);
-    if (!obj) continue;
+    if (!obj.boundingBox) continue;
     const { originX, originY, width, height } = obj.boundingBox;
     ctx.fillText(
-      `${obj.categories[0].categoryName} ${obj.categories[0].score}`,
+      `${obj.categories[0].categoryName} ${obj.categories[0].score.toFixed(3)}`,
       originX,
       originY - 10,
     );
     ctx.strokeRect(originX, originY, width, height);
   }
+}
+
+function shadowCounting(
+  regions: Region[],
+  fingers: Finger[],
+  ctx: CanvasRenderingContext2D,
+) {
+  for (const r of regions) {
+    let shadowCount = 0;
+    const values: number[] = [];
+    const outer = toOuterRegion(r);
+    let imageData = ctx.getImageData(outer.x, outer.y, outer.w, outer.h);
+
+    for (let px = 0; px < outer.w; px++) {
+      for (let py = 0; py < outer.h; py++) {
+        const p = { x: outer.x + px, y: outer.y + py };
+        if (!isOutside(p, r)) continue;
+        const index = toIndex(py, px, outer.w, 4);
+        values.push(imageData.data[index]);
+      }
+    }
+
+    if (fingers.some(({ tip }) => !isOutside(tip, outer)))
+      r.baseline = getMedian(values);
+    const cutoff = (r.baseline ?? getMedian(values)) * 0.8;
+
+    for (const finger of fingers) {
+      const { tip, joint } = finger;
+      const tx = Math.round(tip.x);
+      const ty = Math.round(tip.y);
+      const jx = Math.round(joint.x);
+      const jy = Math.round(joint.y);
+
+      for (let dx = -3; dx <= 3; dx++) {
+        const column = tx + dx;
+        let ix = column - outer.x;
+        for (let dy = -3; dy <= 3; dy++) {
+          if ((jx - tx) * dx + (jy - ty) * dy > 0) continue;
+          const row = ty + dy;
+          let iy = row - outer.y;
+          if (!isOutside({ x: column, y: row }, toOuterRegion(r))) {
+            const index = toIndex(iy, ix, outer.w, 4);
+            if (imageData.data[index] < cutoff) shadowCount += 1;
+          }
+        }
+      }
+    }
+
+    ctx.font = "20px Arial";
+    ctx.fillStyle = "black";
+    ctx.fillText(`${shadowCount}`, r.x, r.y - 10);
+    const inside = fingers.some(({ tip }) => isInside(tip, r));
+    if (inside) {
+      ctx.strokeStyle = "green";
+    } else ctx.strokeStyle = "red";
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+
+    if (inside && !r.touching && shadowCount >= THRESHOLD) {
+      console.log("touch");
+      // touchLoc = r;
+    }
+    r.touching = shadowCount >= THRESHOLD && inside;
+  }
+}
+
+function buildFingers(
+  landmarks: NormalizedLandmark[][],
+  ctx: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+) {
+  const fingers: Finger[] = [];
+  for (const hand of landmarks) {
+    const kx = hand[5].x * canvas.width;
+    const ky = hand[5].y * canvas.height;
+    const jx = hand[7].x * canvas.width;
+    const jy = hand[7].y * canvas.height;
+    const tx = hand[8].x * canvas.width;
+    const ty = hand[8].y * canvas.height;
+
+    drawHand(hand, ctx, canvas);
+    fingers.push({
+      tip: { x: tx, y: ty },
+      joint: { x: jx, y: jy },
+      knuckle: { x: kx, y: ky },
+    });
+  }
+  return fingers;
+}
+
+function pointingHit(fingers: Finger[], objects: Detection[], MAX_D: number) {
+  for (const { tip: t, knuckle: k } of fingers) {
+    const dirX = t.x - k.x;
+    const dirY = t.y - k.y;
+    const len = Math.hypot(dirX, dirY);
+    if (len <= 0) continue;
+    const nx = dirX / len;
+    const ny = dirY / len;
+    for (let d = 0; d <= MAX_D; d += STEP) {
+      const point = { x: t.x + d * nx, y: t.y + d * ny };
+      for (const obj of objects) {
+        const { boundingBox } = obj;
+        if (!boundingBox) continue;
+        if (
+          isInside(point, {
+            x: boundingBox.originX,
+            y: boundingBox.originY,
+            w: boundingBox.width,
+            h: boundingBox.height,
+          })
+        )
+          return obj;
+      }
+    }
+  }
+  return undefined;
 }
 
 // index = (y * cols + x) * channels + c   // gray scale formula   // c: 0=R, 1=G, 2=B, 3=A gray
@@ -123,10 +244,11 @@ async function main() {
   const video = document.getElementById("video") as HTMLVideoElement;
   const ctx = canvas.getContext("2d");
   const pointingAt = document.getElementById("pointing");
+  const MAX_D = Math.hypot(canvas.width, canvas.height);
   let tick = 0;
 
   if (!ctx || !video) return;
-  let touchLoc: Region;
+  let touchLoc: string;
   await startWebcam(video);
 
   video.addEventListener("loadedmetadata", (event) => {
@@ -160,10 +282,6 @@ async function main() {
     ctx.drawImage(video, 0, 0);
     let src = cv.imread("canvas"); // turn imageData into a Mat
     let gray = new cv.Mat(); // empty Mat for for the result
-    const fingers: {
-      tip: { x: number; y: number };
-      joint: { x: number; y: number };
-    }[] = [];
 
     try {
       // cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY); // writes into gray
@@ -175,84 +293,25 @@ async function main() {
           performance.now(),
         );
         for (const obj of objectDetection.detections) {
-          if (obj.categories[0].score < 0.5) continue;
+          if (obj.categories[0].score < 0.4) continue;
           tmp.push(obj);
         }
-        objects = [...tmp];
+        objects = [...tmp].filter(
+          (o) => o.categories[0].categoryName !== "person",
+        );
       }
-      drawObjectDetection(objects, ctx, canvas);
       const handDetection = handLandmarker.detectForVideo(
         video,
         performance.now(),
       );
-
-      ctx.fillStyle = "yellow";
-      for (const hand of handDetection.landmarks) {
-        const x = hand[8].x * canvas.width;
-        const y = hand[8].y * canvas.height;
-        const jx = hand[7].x * canvas.width;
-        const jy = hand[7].y * canvas.height;
-
-        drawHands(hand, ctx, canvas);
-        fingers.push({ tip: { x, y }, joint: { x: jx, y: jy } });
+      drawObjectDetection(objects, ctx, canvas);
+      const fingers = buildFingers(handDetection.landmarks, ctx, canvas);
+      const hit = pointingHit(fingers, objects, MAX_D);
+      if (hit) {
+        touchLoc = hit.categories[0].categoryName;
       }
 
-      for (const r of regions) {
-        let shadowCount = 0;
-        const values: number[] = [];
-        const outer = toOuterRegion(r);
-        let imageData = ctx.getImageData(outer.x, outer.y, outer.w, outer.h);
-
-        for (let px = 0; px < outer.w; px++) {
-          for (let py = 0; py < outer.h; py++) {
-            const p = { x: outer.x + px, y: outer.y + py };
-            if (!isOutside(p, r)) continue;
-            const index = toIndex(py, px, outer.w, 4);
-            values.push(imageData.data[index]);
-          }
-        }
-
-        if (fingers.some(({ tip }) => !isOutside(tip, outer)))
-          r.baseline = getMedian(values);
-        const cutoff = (r.baseline ?? getMedian(values)) * 0.8;
-
-        for (const finger of fingers) {
-          const { tip, joint } = finger;
-          const tx = Math.round(tip.x);
-          const ty = Math.round(tip.y);
-          const jx = Math.round(joint.x);
-          const jy = Math.round(joint.y);
-
-          for (let dx = -3; dx <= 3; dx++) {
-            const column = tx + dx;
-            let ix = column - outer.x;
-            for (let dy = -3; dy <= 3; dy++) {
-              if ((jx - tx) * dx + (jy - ty) * dy > 0) continue;
-              const row = ty + dy;
-              let iy = row - outer.y;
-              if (!isOutside({ x: column, y: row }, toOuterRegion(r))) {
-                const index = toIndex(iy, ix, outer.w, 4);
-                if (imageData.data[index] < cutoff) shadowCount += 1;
-              }
-            }
-          }
-        }
-
-        ctx.font = "20px Arial";
-        ctx.fillStyle = "black";
-        ctx.fillText(`${shadowCount}`, r.x, r.y - 10);
-        const inside = fingers.some(({ tip }) => isInside(tip, r));
-        if (inside) {
-          ctx.strokeStyle = "green";
-        } else ctx.strokeStyle = "red";
-        ctx.strokeRect(r.x, r.y, r.w, r.h);
-
-        if (inside && !r.touching && shadowCount >= THRESHOLD) {
-          console.log("touch");
-          touchLoc = r;
-        }
-        r.touching = shadowCount >= THRESHOLD && inside;
-      }
+      shadowCounting(regions, fingers, ctx);
     } catch (error) {
       console.error(error);
     } finally {
