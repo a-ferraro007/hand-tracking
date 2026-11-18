@@ -311,16 +311,17 @@ async function main() {
 
     try {
       const detectedColors = colorDetection(cv, src, ctx);
-      if (tick % 10 === 0) {
+      if (tick % 5 === 0) {
         const tmp: Detection[] = [];
         const objectDetection = objectDetector.detectForVideo(video, now);
-        for (const obj of objectDetection.detections) {
-          if (Math.round(obj.categories[0].score * 10) / 10 < 0.6) continue;
-          tmp.push(obj);
-        }
-        objects = [...tmp].filter(
+        const filtered = objectDetection.detections.filter(
           (o) => !BLACK_LIST.includes(o.categories[0].categoryName),
         );
+        for (const obj of filtered) {
+          if (Math.round(obj.categories[0].score * 10) / 10 < 0.4) continue;
+          tmp.push(obj);
+        }
+        objects = [...tmp];
       }
       const handDetection = handLandmarker.detectForVideo(video, now);
       drawObjectDetection(objects, ctx, canvas);
