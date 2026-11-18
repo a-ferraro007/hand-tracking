@@ -2,13 +2,13 @@ import "./style.css";
 import { loadOpenCv } from "./lib/opencv";
 import { createHandLandmarker } from "./lib/handLandmarker";
 import { createObjectDetector } from "./lib/objectDetector";
+import { FilesetResolver } from "@mediapipe/tasks-vision";
 import type { Detection, NormalizedLandmark } from "@mediapipe/tasks-vision";
+import { isInside } from "./lib/utils";
 
-const M = 12;
-const THRESHOLD = 25;
-const STEP = 2;
-
-type Region = {
+export type Box = { x: number; y: number; width: number; height: number };
+export type Found = { box: Box; color: string; area: number; stroke: string };
+export type Region = {
   x: number;
   y: number;
   w: number;
@@ -16,12 +16,38 @@ type Region = {
   touching: boolean;
   baseline?: number;
 };
-
-type Finger = {
+export type Finger = {
   tip: { x: number; y: number };
   joint: { x: number; y: number };
   knuckle: { x: number; y: number };
 };
+
+const STEP = 2;
+const MIN_AREA = 1000;
+const BLACK_LIST = [
+  "person",
+  "chair",
+  "dining table",
+  "bed",
+  "toothbrush",
+  "knife",
+];
+const COLORS = [
+  {
+    name: "red",
+    stroke: "red",
+    range: [
+      [0, 10],
+      [170, 179],
+    ],
+    sMin: 150,
+  },
+  { name: "cyan", stroke: "cyan", range: [[60, 100]], sMin: 150 },
+  { name: "blue", stroke: "blue", range: [[102, 124]], sMin: 150 },
+  { name: "purple", stroke: "purple", range: [[125, 160]], sMin: 70 },
+  { name: "mint", stroke: "#3EB489", range: [[60, 100]], sMin: 70, sMax: 120 },
+];
+let probe: { x: number; y: number } | null = null;
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 <section> 
@@ -33,30 +59,25 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 </section>
 `;
 
-function isInside(
-  p: { x: number; y: number },
-  r: { x: number; y: number; w: number; h: number },
-) {
-  return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
-}
-
-function isOutside(
-  p: { x: number; y: number },
-  r: { x: number; y: number; w: number; h: number },
-) {
-  return p.x < r.x || p.x >= r.x + r.w || p.y < r.y || p.y >= r.y + r.h;
-}
-
-function toIndex(row: number, col: number, width: number, pixels: number) {
-  return (row * width + col) * 4;
-}
-
 async function startWebcam(video: HTMLVideoElement) {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
+    const initialStream = await navigator.mediaDevices.getUserMedia({
       video: true,
+    });
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter(
+      (d) => d.label.includes("Logi Webcam"),
+    );
+    initialStream.getTracks().forEach((track) => track.stop());
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        deviceId: {
+          exact: devices[0].deviceId,
+          ideal: devices[0].deviceId,
+        },
+      },
       audio: false,
     });
+
     video.srcObject = stream;
   } catch (error) {
     console.error(error);
@@ -68,21 +89,6 @@ function toCanvasXY(evt: MouseEvent, canvas: HTMLCanvasElement) {
     x: evt.offsetX * (canvas.width / canvas.clientWidth),
     y: evt.offsetY * (canvas.height / canvas.clientHeight),
   };
-}
-
-function toOuterRegion(r: Region) {
-  return { x: r.x - M, y: r.y - M, w: r.w + 2 * M, h: r.h + 2 * M };
-}
-
-function getMedian(arr: number[]) {
-  if (!arr.length) return 0;
-
-  const sorted = arr.toSorted((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-
-  return sorted.length % 2 === 0
-    ? (sorted[mid - 1] + sorted[mid]) / 2
-    : sorted[mid];
 }
 
 function drawHand(
@@ -120,69 +126,6 @@ function drawObjectDetection(
   }
 }
 
-function shadowCounting(
-  regions: Region[],
-  fingers: Finger[],
-  ctx: CanvasRenderingContext2D,
-) {
-  for (const r of regions) {
-    let shadowCount = 0;
-    const values: number[] = [];
-    const outer = toOuterRegion(r);
-    let imageData = ctx.getImageData(outer.x, outer.y, outer.w, outer.h);
-
-    for (let px = 0; px < outer.w; px++) {
-      for (let py = 0; py < outer.h; py++) {
-        const p = { x: outer.x + px, y: outer.y + py };
-        if (!isOutside(p, r)) continue;
-        const index = toIndex(py, px, outer.w, 4);
-        values.push(imageData.data[index]);
-      }
-    }
-
-    if (fingers.some(({ tip }) => !isOutside(tip, outer)))
-      r.baseline = getMedian(values);
-    const cutoff = (r.baseline ?? getMedian(values)) * 0.8;
-
-    for (const finger of fingers) {
-      const { tip, joint } = finger;
-      const tx = Math.round(tip.x);
-      const ty = Math.round(tip.y);
-      const jx = Math.round(joint.x);
-      const jy = Math.round(joint.y);
-
-      for (let dx = -3; dx <= 3; dx++) {
-        const column = tx + dx;
-        let ix = column - outer.x;
-        for (let dy = -3; dy <= 3; dy++) {
-          if ((jx - tx) * dx + (jy - ty) * dy > 0) continue;
-          const row = ty + dy;
-          let iy = row - outer.y;
-          if (!isOutside({ x: column, y: row }, toOuterRegion(r))) {
-            const index = toIndex(iy, ix, outer.w, 4);
-            if (imageData.data[index] < cutoff) shadowCount += 1;
-          }
-        }
-      }
-    }
-
-    ctx.font = "20px Arial";
-    ctx.fillStyle = "black";
-    ctx.fillText(`${shadowCount}`, r.x, r.y - 10);
-    const inside = fingers.some(({ tip }) => isInside(tip, r));
-    if (inside) {
-      ctx.strokeStyle = "green";
-    } else ctx.strokeStyle = "red";
-    ctx.strokeRect(r.x, r.y, r.w, r.h);
-
-    if (inside && !r.touching && shadowCount >= THRESHOLD) {
-      console.log("touch");
-      // touchLoc = r;
-    }
-    r.touching = shadowCount >= THRESHOLD && inside;
-  }
-}
-
 function buildFingers(
   landmarks: NormalizedLandmark[][],
   ctx: CanvasRenderingContext2D,
@@ -207,7 +150,11 @@ function buildFingers(
   return fingers;
 }
 
-function pointingHit(fingers: Finger[], objects: Detection[], MAX_D: number) {
+function pointingHit(
+  fingers: Finger[],
+  objects: { box: Box; tag: string }[],
+  MAX_D: number,
+) {
   for (const { tip: t, knuckle: k } of fingers) {
     const dirX = t.x - k.x;
     const dirY = t.y - k.y;
@@ -218,14 +165,14 @@ function pointingHit(fingers: Finger[], objects: Detection[], MAX_D: number) {
     for (let d = 0; d <= MAX_D; d += STEP) {
       const point = { x: t.x + d * nx, y: t.y + d * ny };
       for (const obj of objects) {
-        const { boundingBox } = obj;
-        if (!boundingBox) continue;
+        const { box } = obj;
+        if (!box) continue;
         if (
           isInside(point, {
-            x: boundingBox.originX,
-            y: boundingBox.originY,
-            w: boundingBox.width,
-            h: boundingBox.height,
+            x: box.x,
+            y: box.y,
+            w: box.width,
+            h: box.height,
           })
         )
           return obj;
@@ -235,20 +182,96 @@ function pointingHit(fingers: Finger[], objects: Detection[], MAX_D: number) {
   return undefined;
 }
 
-// index = (y * cols + x) * channels + c   // gray scale formula   // c: 0=R, 1=G, 2=B, 3=A gray
+function colorDetection(cv: any, src: any, ctx: CanvasRenderingContext2D) {
+  const vMin = 140;
+  const found: Found[] = [];
+  const hsv = new cv.Mat();
+  const rgb = new cv.Mat();
+
+  cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
+  cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+
+  for (const color of COLORS) {
+    let mask = new cv.Mat.zeros(hsv.rows, hsv.cols, cv.CV_8UC1);
+    const hierarchy = new cv.Mat();
+    const contours = new cv.MatVector();
+
+    for (const range of color.range) {
+      const low = new cv.Mat(hsv.rows, hsv.cols, cv.CV_8UC3, [
+        range[0],
+        color.sMin,
+        vMin,
+        0,
+      ]);
+      const high = new cv.Mat(hsv.rows, hsv.cols, cv.CV_8UC3, [
+        range[1],
+        color.sMax ?? 255,
+        255,
+        0,
+      ]);
+      const partial = new cv.Mat();
+      cv.inRange(hsv, low, high, partial);
+      cv.bitwise_or(mask, partial, mask);
+
+      if (probe) {
+        const x = Math.round(probe.x);
+        const y = Math.round(probe.y);
+        const i = (y * hsv.cols + x) * 3;
+        console.log("HSV", hsv.data[i], hsv.data[i + 1], hsv.data[i + 2]);
+        probe = null;
+      }
+      partial.delete();
+      low.delete();
+      high.delete();
+    }
+    cv.findContours(
+      mask,
+      contours,
+      hierarchy,
+      cv.RETR_EXTERNAL,
+      cv.CHAIN_APPROX_SIMPLE,
+    );
+
+    for (let i = 0; i < contours.size(); i++) {
+      const c = contours.get(i);
+      const area = cv.contourArea(c);
+      if (area < MIN_AREA) continue;
+      const box = cv.boundingRect(c);
+      found.push({ box, color: color.name, area, stroke: color.stroke });
+    }
+    hierarchy.delete();
+    contours.delete();
+    mask.delete();
+  }
+  hsv.delete();
+  rgb.delete();
+
+  for (const { box, color, stroke } of found) {
+    const { x, y, width, height } = box;
+    ctx.strokeStyle = stroke;
+    ctx.strokeRect(x, y, width, height);
+  }
+
+  return found;
+}
+
 async function main() {
   const cv = await loadOpenCv();
-  const handLandmarker = await createHandLandmarker();
-  const objectDetector = await createObjectDetector();
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.3/wasm",
+  );
+  const handLandmarker = await createHandLandmarker(vision);
+  const objectDetector = await createObjectDetector(vision);
   const canvas = document.getElementById("canvas") as HTMLCanvasElement;
   const video = document.getElementById("video") as HTMLVideoElement;
   const ctx = canvas.getContext("2d");
   const pointingAt = document.getElementById("pointing");
   const MAX_D = Math.hypot(canvas.width, canvas.height);
   let tick = 0;
+  let ts = 0;
 
   if (!ctx || !video) return;
-  let touchLoc: string;
+  let touchLoc: string | undefined = undefined;
   await startWebcam(video);
 
   video.addEventListener("loadedmetadata", (event) => {
@@ -262,6 +285,7 @@ async function main() {
 
   canvas.addEventListener("mousedown", (evt) => {
     start = toCanvasXY(evt, canvas);
+    probe = toCanvasXY(evt, canvas);
   });
 
   canvas.addEventListener("mouseup", (evt) => {
@@ -279,46 +303,56 @@ async function main() {
 
   let objects: Detection[] = [];
   const render = () => {
+    const now = ++ts;
     ctx.drawImage(video, 0, 0);
-    let src = cv.imread("canvas"); // turn imageData into a Mat
-    let gray = new cv.Mat(); // empty Mat for for the result
+
+    let src = cv.imread("canvas");
+    let gray = new cv.Mat();
 
     try {
-      // cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY); // writes into gray
-      // cv.imshow(canvas, gray); // draws gray onto canvas
-      if (tick % 5 === 0) {
+      const detectedColors = colorDetection(cv, src, ctx);
+      if (tick % 10 === 0) {
         const tmp: Detection[] = [];
-        const objectDetection = objectDetector.detectForVideo(
-          video,
-          performance.now(),
-        );
+        const objectDetection = objectDetector.detectForVideo(video, now);
         for (const obj of objectDetection.detections) {
-          if (obj.categories[0].score < 0.4) continue;
+          if (Math.round(obj.categories[0].score * 10) / 10 < 0.6) continue;
           tmp.push(obj);
         }
         objects = [...tmp].filter(
-          (o) => o.categories[0].categoryName !== "person",
+          (o) => !BLACK_LIST.includes(o.categories[0].categoryName),
         );
       }
-      const handDetection = handLandmarker.detectForVideo(
-        video,
-        performance.now(),
-      );
+      const handDetection = handLandmarker.detectForVideo(video, now);
       drawObjectDetection(objects, ctx, canvas);
       const fingers = buildFingers(handDetection.landmarks, ctx, canvas);
-      const hit = pointingHit(fingers, objects, MAX_D);
-      if (hit) {
-        touchLoc = hit.categories[0].categoryName;
-      }
 
-      shadowCounting(regions, fingers, ctx);
-    } catch (error) {
-      console.error(error);
+      const boundingBoxes = [
+        ...detectedColors.map((dc) => ({ box: dc.box, tag: dc.color })),
+        ...objects
+          .filter((o) => o.boundingBox)
+          .map((o) => ({
+            box: {
+              x: o.boundingBox?.originX!,
+              y: o.boundingBox?.originY!,
+              width: o.boundingBox?.width!,
+              height: o.boundingBox?.height!,
+            },
+            tag: o.categories[0].categoryName,
+          })),
+      ];
+
+      const hit = pointingHit(fingers, boundingBoxes, MAX_D);
+      if (hit) {
+        touchLoc = hit.tag;
+      }
+    } catch (e) {
+      console.error(typeof e === "number" ? cv.exceptionFromPtr(e) : e);
     } finally {
       src.delete();
       gray.delete();
       if (pointingAt)
         pointingAt.textContent = `Pointing at: ${JSON.stringify(touchLoc) ?? ""}`;
+      touchLoc = undefined;
       tick++;
       requestAnimationFrame(render);
     }

@@ -1,9 +1,6 @@
-import { FilesetResolver, ObjectDetector } from "@mediapipe/tasks-vision";
+import { ObjectDetector } from "@mediapipe/tasks-vision";
 
-export const createObjectDetector = async () => {
-  const vision = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm",
-  );
+export const createObjectDetector = async (vision: any) => {
   const objectDetector = await ObjectDetector.createFromOptions(vision, {
     baseOptions: {
       modelAssetPath:
