@@ -5,6 +5,8 @@ import { createObjectDetector } from "./lib/objectDetector";
 import { FilesetResolver } from "@mediapipe/tasks-vision";
 import type { Detection, NormalizedLandmark } from "@mediapipe/tasks-vision";
 import { isInside } from "./lib/utils";
+import { COLORS } from "./lib/colors";
+import { mountSessionPanel } from "./ui/sessionPanel";
 
 export type Box = { x: number; y: number; width: number; height: number };
 export type Found = { box: Box; color: string; area: number; stroke: string };
@@ -32,21 +34,6 @@ const BLACK_LIST = [
   "toothbrush",
   "knife",
 ];
-const COLORS = [
-  {
-    name: "red",
-    stroke: "red",
-    range: [
-      [0, 10],
-      [170, 179],
-    ],
-    sMin: 150,
-  },
-  { name: "cyan", stroke: "cyan", range: [[60, 100]], sMin: 150 },
-  { name: "blue", stroke: "blue", range: [[102, 124]], sMin: 150 },
-  { name: "purple", stroke: "purple", range: [[125, 160]], sMin: 70 },
-  { name: "mint", stroke: "#3EB489", range: [[60, 100]], sMin: 70, sMax: 120 },
-];
 let probe: { x: number; y: number } | null = null;
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
@@ -57,7 +44,9 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <p id="pointing">Pointing at: </p>
     </div>
 </section>
+<div id="session-panel"></div>
 `;
+mountSessionPanel(document.getElementById("session-panel")!);
 
 async function startWebcam(video: HTMLVideoElement) {
   try {
