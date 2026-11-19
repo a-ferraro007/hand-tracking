@@ -44,13 +44,11 @@ const BLACK_LIST = [
   "knife",
 ];
 let probe: { x: number; y: number } | null = null;
-
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 <section> 
     <div style="padding-top:100px;">
     <canvas id="canvas" width="640" height="480" ></canvas>
     <video id="video" autoplay  playsInline muted class="hidden" ></video>
-      <p id="pointing">Pointing at: </p>
     </div>
 </section>
 <div id="session-panel"></div>
@@ -191,15 +189,20 @@ function colorDetection(
   const hsv = new cv.Mat();
   const rgb = new cv.Mat();
 
+  // src frame comes through as RGBA -> converts HSV
+  // RGBA2RGB and RGB2HSV are 3 bytes per pixel
+  // i = (row * cols + col) * 3 gives the index of the row/column with the pixel data
   cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
   cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
 
   for (const color of COLORS) {
+    // mask starts as a black mask -> nothing selected
     let mask = cv.Mat.zeros(hsv.rows, hsv.cols, cv.CV_8UC1);
     const hierarchy = new cv.Mat();
     const contours = new cv.MatVector();
 
     for (const range of color.range) {
+      // Build two mats at the extreme ends of the color we're looking for
       const low = new cv.Mat(hsv.rows, hsv.cols, cv.CV_8UC3, [
         range[0],
         color.sMin,
@@ -212,8 +215,13 @@ function colorDetection(
         255,
         0,
       ]);
+
+      // if the hsv value of the frame is with in the high / low range, write 255 into partial as CV_8UC1
+      // CV8UC1 is 1 byte per pixel.
       const partial = new cv.Mat();
       cv.inRange(hsv, low, high, partial);
+      // bitwise_or on the mask and partial. If partial is inRange it's 255.
+      // Essentially creates a mask where white is the matching color and black is not matching
       cv.bitwise_or(mask, partial, mask);
 
       if (probe) {
@@ -223,10 +231,14 @@ function colorDetection(
         console.log("HSV", hsv.data[i], hsv.data[i + 1], hsv.data[i + 2]);
         probe = null;
       }
+
       partial.delete();
       low.delete();
       high.delete();
     }
+
+    // Writes a list of points tracing the outline of one connected white blob ( the matching color ) into
+    // the contours MatVector
     cv.findContours(
       mask,
       contours,
@@ -328,7 +340,7 @@ async function main() {
         const tmp: Detection[] = [];
         const objectDetection = objectDetector.detectForVideo(video, now);
         for (const obj of objectDetection.detections) {
-          if (Math.round(obj.categories[0].score * 10) / 10 < 0.5) continue;
+          if (Math.round(obj.categories[0].score * 10) / 10 < 0.6) continue;
           tmp.push(obj);
         }
         const filtered = [...tmp].filter(
