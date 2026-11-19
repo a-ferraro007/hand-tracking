@@ -96,7 +96,6 @@ function shadowCounting(
     ctx.strokeRect(r.x, r.y, r.w, r.h);
 
     if (inside && !r.touching && shadowCount >= THRESHOLD) {
-      console.log("touch");
     }
     r.touching = shadowCount >= THRESHOLD && inside;
   }
@@ -159,6 +158,7 @@ function _mergeBoundingBoxes(found: Found[]): Found[] {
       box: { x: left, y: top, width: right - left, height: bottom - top },
       color,
       area: group.reduce((sum, g) => sum + g.area, 0),
+      stroke: "",
     });
   }
 

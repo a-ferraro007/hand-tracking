@@ -5,6 +5,16 @@ import { createObjectDetector } from "./lib/objectDetector";
 import { FilesetResolver } from "@mediapipe/tasks-vision";
 import type { Detection, NormalizedLandmark } from "@mediapipe/tasks-vision";
 import { isInside } from "./lib/utils";
+import { COLORS } from "./lib/colors";
+import { mountSessionPanel } from "./ui/sessionPanel";
+import {
+  getActiveSession,
+  getCurrentPrompt,
+  recordEvent,
+  updateScene,
+} from "./ui/session";
+import { createPointGate } from "./lib/pointGate";
+import { createGrabGate } from "./lib/grabGate";
 
 export type Box = { x: number; y: number; width: number; height: number };
 export type Found = { box: Box; color: string; area: number; stroke: string };
@@ -21,6 +31,7 @@ export type Finger = {
   joint: { x: number; y: number };
   knuckle: { x: number; y: number };
 };
+export type NormalizedObject = { box: Box; tag: string };
 
 const STEP = 2;
 const MIN_AREA = 1000;
@@ -32,21 +43,6 @@ const BLACK_LIST = [
   "toothbrush",
   "knife",
 ];
-const COLORS = [
-  {
-    name: "red",
-    stroke: "red",
-    range: [
-      [0, 10],
-      [170, 179],
-    ],
-    sMin: 150,
-  },
-  { name: "cyan", stroke: "cyan", range: [[60, 100]], sMin: 150 },
-  { name: "blue", stroke: "blue", range: [[102, 124]], sMin: 150 },
-  { name: "purple", stroke: "purple", range: [[125, 160]], sMin: 70 },
-  { name: "mint", stroke: "#3EB489", range: [[60, 100]], sMin: 70, sMax: 120 },
-];
 let probe: { x: number; y: number } | null = null;
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
@@ -57,7 +53,9 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <p id="pointing">Pointing at: </p>
     </div>
 </section>
+<div id="session-panel"></div>
 `;
+mountSessionPanel(document.getElementById("session-panel")!);
 
 async function startWebcam(video: HTMLVideoElement) {
   try {
@@ -182,7 +180,12 @@ function pointingHit(
   return undefined;
 }
 
-function colorDetection(cv: any, src: any, ctx: CanvasRenderingContext2D) {
+function colorDetection(
+  cv: any,
+  src: any,
+  ctx: CanvasRenderingContext2D,
+  objects: NormalizedObject[],
+) {
   const vMin = 140;
   const found: Found[] = [];
   const hsv = new cv.Mat();
@@ -192,7 +195,7 @@ function colorDetection(cv: any, src: any, ctx: CanvasRenderingContext2D) {
   cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
 
   for (const color of COLORS) {
-    let mask = new cv.Mat.zeros(hsv.rows, hsv.cols, cv.CV_8UC1);
+    let mask = cv.Mat.zeros(hsv.rows, hsv.cols, cv.CV_8UC1);
     const hierarchy = new cv.Mat();
     const contours = new cv.MatVector();
 
@@ -235,8 +238,16 @@ function colorDetection(cv: any, src: any, ctx: CanvasRenderingContext2D) {
     for (let i = 0; i < contours.size(); i++) {
       const c = contours.get(i);
       const area = cv.contourArea(c);
-      if (area < MIN_AREA) continue;
       const box = cv.boundingRect(c);
+      c.delete();
+      if (area < MIN_AREA) continue;
+      const covered = objects.some(({ box: o }) =>
+        isInside(
+          { x: box.x, y: box.y },
+          { x: o.x, y: o.y, w: o.width, h: o.height },
+        ),
+      );
+      if (covered) continue;
       found.push({ box, color: color.name, area, stroke: color.stroke });
     }
     hierarchy.delete();
@@ -265,13 +276,15 @@ async function main() {
   const canvas = document.getElementById("canvas") as HTMLCanvasElement;
   const video = document.getElementById("video") as HTMLVideoElement;
   const ctx = canvas.getContext("2d");
-  const pointingAt = document.getElementById("pointing");
+
   const MAX_D = Math.hypot(canvas.width, canvas.height);
   let tick = 0;
   let ts = 0;
 
   if (!ctx || !video) return;
-  let touchLoc: string | undefined = undefined;
+  let globalHit: string | undefined = undefined;
+  const pointGate = createPointGate();
+  const grabGate = createGrabGate();
   await startWebcam(video);
 
   video.addEventListener("loadedmetadata", (event) => {
@@ -304,56 +317,69 @@ async function main() {
   let objects: Detection[] = [];
   const render = () => {
     const now = ++ts;
-    ctx.drawImage(video, 0, 0);
-
-    let src = cv.imread("canvas");
     let gray = new cv.Mat();
+    ctx.drawImage(video, 0, 0);
+    let src = cv.imread("canvas");
 
+    let present: Set<string> | undefined;
+    let handVisible = false;
     try {
-      const detectedColors = colorDetection(cv, src, ctx);
       if (tick % 5 === 0) {
         const tmp: Detection[] = [];
         const objectDetection = objectDetector.detectForVideo(video, now);
-        const filtered = objectDetection.detections.filter(
-          (o) => !BLACK_LIST.includes(o.categories[0].categoryName),
-        );
-        for (const obj of filtered) {
-          if (Math.round(obj.categories[0].score * 10) / 10 < 0.4) continue;
+        for (const obj of objectDetection.detections) {
+          if (Math.round(obj.categories[0].score * 10) / 10 < 0.5) continue;
           tmp.push(obj);
         }
-        objects = [...tmp];
+        const filtered = [...tmp].filter(
+          (o) => !BLACK_LIST.includes(o.categories[0].categoryName),
+        );
+        objects = [...filtered];
       }
       const handDetection = handLandmarker.detectForVideo(video, now);
-      drawObjectDetection(objects, ctx, canvas);
+      handVisible = handDetection.landmarks.length > 0;
       const fingers = buildFingers(handDetection.landmarks, ctx, canvas);
-
+      const normalizedObjects = objects
+        .filter((o) => o.boundingBox)
+        .map((o) => ({
+          box: {
+            x: o.boundingBox?.originX!,
+            y: o.boundingBox?.originY!,
+            width: o.boundingBox?.width!,
+            height: o.boundingBox?.height!,
+          },
+          tag: o.categories[0].categoryName,
+        }));
+      drawObjectDetection(objects, ctx, canvas);
+      const detectedColors = colorDetection(cv, src, ctx, normalizedObjects);
       const boundingBoxes = [
         ...detectedColors.map((dc) => ({ box: dc.box, tag: dc.color })),
-        ...objects
-          .filter((o) => o.boundingBox)
-          .map((o) => ({
-            box: {
-              x: o.boundingBox?.originX!,
-              y: o.boundingBox?.originY!,
-              width: o.boundingBox?.width!,
-              height: o.boundingBox?.height!,
-            },
-            tag: o.categories[0].categoryName,
-          })),
+        ...normalizedObjects,
       ];
+      present = new Set(boundingBoxes.map((b) => b.tag));
 
       const hit = pointingHit(fingers, boundingBoxes, MAX_D);
       if (hit) {
-        touchLoc = hit.tag;
+        globalHit = hit.tag;
       }
     } catch (e) {
       console.error(typeof e === "number" ? cv.exceptionFromPtr(e) : e);
     } finally {
       src.delete();
       gray.delete();
-      if (pointingAt)
-        pointingAt.textContent = `Pointing at: ${JSON.stringify(touchLoc) ?? ""}`;
-      touchLoc = undefined;
+      if (present) updateScene(present, performance.now());
+      const pointed = pointGate(globalHit, performance.now());
+      if (pointed && getActiveSession()?.goal === "point") {
+        recordEvent(pointed);
+      }
+      const grabbed = present
+        ? grabGate(present, handVisible, performance.now())
+        : [];
+      if (grabbed.length && getActiveSession()?.goal === "grab") {
+        const target = getCurrentPrompt()?.target.tag;
+        recordEvent(grabbed.find((g) => g === target) ?? grabbed[0]);
+      }
+      globalHit = undefined;
       tick++;
       requestAnimationFrame(render);
     }
