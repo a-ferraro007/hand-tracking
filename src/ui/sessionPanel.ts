@@ -1,9 +1,10 @@
 import {
   GOALS,
-  TARGETS,
   endSession,
   getActiveSession,
   getCurrentPrompt,
+  getScene,
+  onSessionChange,
   recordEvent,
   startSession,
 } from "./session";
@@ -30,9 +31,12 @@ export function mountSessionPanel(root: HTMLElement) {
   let selected: GoalType | undefined;
   let result: SessionResult | undefined;
   let timer: number | undefined;
+  let unsubscribe: (() => void) | undefined;
 
   const render = () => {
     clearInterval(timer);
+    unsubscribe?.();
+    unsubscribe = undefined;
     if (phase === "choose") renderChoose();
     else if (phase === "active") renderActive();
     else renderResults();
@@ -82,9 +86,7 @@ export function mountSessionPanel(root: HTMLElement) {
       <button id="end-session" class="primary">End session</button>
       <details class="simulate">
         <summary>Simulate CV event</summary>
-        <div class="simulate-tags">
-          ${TARGETS.map((t) => `<button data-tag="${t.tag}">${targetLabel(t)}</button>`).join("")}
-        </div>
+        <div class="simulate-tags" id="simulate-tags"></div>
       </details>
     `;
     const promptEl = document.getElementById("session-prompt")!;
@@ -92,17 +94,25 @@ export function mountSessionPanel(root: HTMLElement) {
     const elapsed = document.getElementById("session-elapsed")!;
     const correct = document.getElementById("session-correct")!;
     const missed = document.getElementById("session-missed")!;
+    const simulate = document.getElementById("simulate-tags")!;
 
     const showPrompt = () => {
-      const prompt = getCurrentPrompt()!;
-      promptEl.innerHTML = `
+      const prompt = getCurrentPrompt();
+      promptEl.innerHTML = prompt
+        ? `
         <span class="prompt-verb">${GOALS[session.goal].verb}</span>
         <span class="prompt-target">${targetLabel(prompt.target)}</span>
-      `;
-      missesEl.innerHTML = prompt.misses
+      `
+        : `<span class="prompt-verb">Waiting for something in view…</span>`;
+      missesEl.innerHTML = (prompt?.misses ?? [])
         .map((m) => `<span class="miss">${m.tag}</span>`)
         .join("");
-      correct.textContent = `${session.prompts.length - 1}`;
+      simulate.innerHTML = getScene().length
+        ? getScene()
+            .map((t) => `<button data-tag="${t.tag}">${targetLabel(t)}</button>`)
+            .join("")
+        : `<span class="empty">Nothing in view</span>`;
+      correct.textContent = `${session.prompts.filter((p) => p.completedAt).length}`;
       missed.textContent = `${session.prompts.reduce((n, p) => n + p.misses.length, 0)}`;
     };
 
@@ -114,18 +124,19 @@ export function mountSessionPanel(root: HTMLElement) {
     };
 
     showPrompt();
+    unsubscribe = onSessionChange((attempt) => {
+      showPrompt();
+      if (attempt) flash(attempt);
+    });
     timer = setInterval(() => {
       elapsed.textContent = formatDuration(Date.now() - session.startedAt);
     }, 250);
 
-    root.querySelectorAll<HTMLButtonElement>(".simulate-tags button").forEach((btn) =>
-      btn.addEventListener("click", () => {
-        const attempt = recordEvent(btn.dataset.tag!);
-        if (!attempt) return;
-        showPrompt();
-        flash(attempt);
-      }),
-    );
+    simulate.addEventListener("click", (evt) => {
+      const tag = (evt.target as HTMLElement).closest<HTMLElement>("[data-tag]")
+        ?.dataset.tag;
+      if (tag) recordEvent(tag);
+    });
     document.getElementById("end-session")!.addEventListener("click", () => {
       result = endSession();
       phase = "results";

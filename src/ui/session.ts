@@ -26,7 +26,10 @@ export type SessionResult = {
   prompts: Prompt[];
 };
 
-export const GOALS: Record<GoalType, { label: string; verb: string; description: string }> = {
+export const GOALS: Record<
+  GoalType,
+  { label: string; verb: string; description: string }
+> = {
   point: {
     label: "Point at objects",
     verb: "Point at",
@@ -39,32 +42,85 @@ export const GOALS: Record<GoalType, { label: string; verb: string; description:
   },
 };
 
-// Object tags are COCO labels the object detector can report.
-const OBJECTS = ["cup", "bottle", "cell phone", "book", "remote", "scissors"];
-
-export const TARGETS: Target[] = [
-  ...COLORS.map((c) => ({ tag: c.name, kind: "color" as const, swatch: c.stroke })),
-  ...OBJECTS.map((tag) => ({ tag, kind: "object" as const })),
-];
+// A tag joins the scene once seen for SCENE_STABLE_MS and leaves after
+// SCENE_ABSENT_MS unseen, so prompts only use things reliably in view.
+const SCENE_STABLE_MS = 500;
+const SCENE_ABSENT_MS = 800;
 
 let active: Session | undefined;
+let scene: Target[] = [];
+const sceneTracks = new Map<string, { firstSeen: number; lastSeen: number }>();
+const listeners = new Set<(attempt?: Attempt) => void>();
+
+// Fires on attempts, prompt changes, and scene changes.
+export function onSessionChange(fn: (attempt?: Attempt) => void) {
+  listeners.add(fn);
+  return () => {
+    listeners.delete(fn);
+  };
+}
+
+function notify<T extends Attempt | undefined>(attempt?: T) {
+  listeners.forEach((fn) => fn(attempt));
+  return attempt;
+}
+
+export function toTarget(tag: string): Target {
+  const color = COLORS.find((c) => c.name === tag);
+  return color
+    ? { tag, kind: "color", swatch: color.stroke }
+    : { tag, kind: "object" };
+}
+
+export function getScene() {
+  return scene;
+}
+
+// Hook for the CV loop: call every frame with all tags currently detected.
+export function updateScene(present: Set<string>, now: number) {
+  for (const tag of present) {
+    if (tag === "mint") continue;
+    const t = sceneTracks.get(tag);
+    if (t) t.lastSeen = now;
+    else sceneTracks.set(tag, { firstSeen: now, lastSeen: now });
+  }
+  for (const [tag, t] of sceneTracks) {
+    if (now - t.lastSeen >= SCENE_ABSENT_MS) sceneTracks.delete(tag);
+  }
+  const stable = [...sceneTracks]
+    .filter(([, t]) => t.lastSeen - t.firstSeen >= SCENE_STABLE_MS)
+    .map(([tag]) => tag)
+    .sort();
+  if (stable.join() === scene.map((t) => t.tag).join()) return;
+  scene = stable.map(toTarget);
+  if (active && !getCurrentPrompt()) openPrompt();
+  notify();
+}
 
 export function getActiveSession() {
   return active;
 }
 
+// The open prompt, or undefined while waiting for something in view.
 export function getCurrentPrompt() {
-  return active?.prompts.at(-1);
+  const last = active?.prompts.at(-1);
+  return last && !last.completedAt ? last : undefined;
 }
 
-function nextPrompt(previous?: Target): Prompt {
-  const pool = TARGETS.filter((t) => t.tag !== previous?.tag);
+// Picks a new target from the scene, avoiding an immediate repeat. A grabbed
+// target is gone, so grab sessions never fall back to repeating it.
+function openPrompt(previous?: Target) {
+  if (!active) return;
+  let pool = scene.filter((t) => t.tag !== previous?.tag);
+  if (!pool.length && active.goal === "point") pool = scene;
+  if (!pool.length) return;
   const target = pool[Math.floor(Math.random() * pool.length)];
-  return { target, shownAt: Date.now(), misses: [] };
+  active.prompts.push({ target, shownAt: Date.now(), misses: [] });
 }
 
 export function startSession(goal: GoalType) {
-  active = { goal, startedAt: Date.now(), prompts: [nextPrompt()] };
+  active = { goal, startedAt: Date.now(), prompts: [] };
+  openPrompt();
   return active;
 }
 
@@ -73,14 +129,15 @@ export function startSession(goal: GoalType) {
 export function recordEvent(tag: string): Attempt | undefined {
   const prompt = getCurrentPrompt();
   if (!active || !prompt) return undefined;
+
   const at = Date.now();
   if (tag !== prompt.target.tag) {
     prompt.misses.push({ at, tag });
-    return { correct: false, prompt };
+    return notify({ correct: false, prompt });
   }
   prompt.completedAt = at;
-  active.prompts.push(nextPrompt(prompt.target));
-  return { correct: true, prompt };
+  openPrompt(prompt.target);
+  return notify({ correct: true, prompt });
 }
 
 export function endSession(): SessionResult | undefined {
