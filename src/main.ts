@@ -26,10 +26,17 @@ export type Region = {
   touching: boolean;
   baseline?: number;
 };
-export type Finger = {
+export type Hand = {
   tip: { x: number; y: number };
   joint: { x: number; y: number };
   knuckle: { x: number; y: number };
+};
+type Pt3 = { x: number; y: number; z: number };
+type Finger = { tip: Pt3; knuckle: Pt3; joint: Pt3 };
+export type PosedHand = {
+  index: Finger;
+  middle: Finger;
+  wrist: Pt3;
 };
 export type NormalizedObject = { box: Box; tag: string };
 
@@ -122,36 +129,80 @@ function drawObjectDetection(
   }
 }
 
-function buildFingers(
+function buildHand(
   landmarks: NormalizedLandmark[][],
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
 ) {
-  const fingers: Finger[] = [];
-  for (const hand of landmarks) {
-    const kx = hand[5].x * canvas.width;
-    const ky = hand[5].y * canvas.height;
-    const jx = hand[7].x * canvas.width;
-    const jy = hand[7].y * canvas.height;
-    const tx = hand[8].x * canvas.width;
-    const ty = hand[8].y * canvas.height;
+  const hands: Hand[] = [];
+  const posedHands: PosedHand[] = [];
+  for (const h of landmarks) {
+    const kx = h[5].x * canvas.width;
+    const ky = h[5].y * canvas.height;
+    const jx = h[7].x * canvas.width;
+    const jy = h[7].y * canvas.height;
+    const tx = h[8].x * canvas.width;
+    const ty = h[8].y * canvas.height;
 
-    drawHand(hand, ctx, canvas);
-    fingers.push({
+    const posedHand: PosedHand = {
+      index: {
+        tip: {
+          x: h[8].x * canvas.width,
+          y: h[8].y * canvas.height,
+          z: h[8].z * canvas.width,
+        },
+        knuckle: {
+          x: h[5].x * canvas.width,
+          y: h[5].y * canvas.height,
+          z: h[5].z * canvas.width,
+        },
+        joint: {
+          x: h[7].x * canvas.width,
+          y: h[7].y * canvas.height,
+          z: h[7].z * canvas.width,
+        },
+      },
+      middle: {
+        tip: {
+          x: h[12].x * canvas.width,
+          y: h[12].y * canvas.height,
+          z: h[12].z * canvas.width,
+        },
+        knuckle: {
+          x: h[9].x * canvas.width,
+          y: h[9].y * canvas.height,
+          z: h[9].z * canvas.width,
+        },
+        joint: {
+          x: h[11].x * canvas.width,
+          y: h[11].y * canvas.height,
+          z: h[11].z * canvas.width,
+        },
+      },
+      wrist: {
+        x: h[0].x * canvas.width,
+        y: h[0].y * canvas.height,
+        z: h[0].z * canvas.width,
+      },
+    };
+
+    drawHand(h, ctx, canvas);
+    hands.push({
       tip: { x: tx, y: ty },
       joint: { x: jx, y: jy },
       knuckle: { x: kx, y: ky },
     });
+    posedHands.push(posedHand);
   }
-  return fingers;
+  return { hands, posedHands };
 }
 
 function pointingHit(
-  fingers: Finger[],
+  hand: Hand[],
   objects: { box: Box; tag: string }[],
   MAX_D: number,
 ) {
-  for (const { tip: t, knuckle: k } of fingers) {
+  for (const { tip: t, knuckle: k } of hand) {
     const dirX = t.x - k.x;
     const dirY = t.y - k.y;
     const len = Math.hypot(dirX, dirY);
@@ -278,6 +329,28 @@ function colorDetection(
   return found;
 }
 
+function straightLineDistance(a: Pt3, b: Pt3) {
+  return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+function isExtended(finger: Finger, wrist: Pt3) {
+  return (
+    straightLineDistance(finger.tip, wrist) >
+    straightLineDistance(finger.knuckle, wrist)
+  );
+}
+
+function poseCheck(posedHands: PosedHand[]) {
+  for (const hand of posedHands) {
+    const { index, middle, wrist } = hand;
+    const indexExtended = isExtended(index, wrist);
+    const middleExtended = isExtended(middle, wrist);
+
+    if (indexExtended && !middleExtended) return true;
+  }
+  return false;
+}
+
 async function main() {
   const cv = await loadOpenCv();
   const vision = await FilesetResolver.forVisionTasks(
@@ -350,7 +423,11 @@ async function main() {
       }
       const handDetection = handLandmarker.detectForVideo(video, now);
       handVisible = handDetection.landmarks.length > 0;
-      const fingers = buildFingers(handDetection.landmarks, ctx, canvas);
+      const { hands, posedHands } = buildHand(
+        handDetection.landmarks,
+        ctx,
+        canvas,
+      );
       const normalizedObjects = objects
         .filter((o) => o.boundingBox)
         .map((o) => ({
@@ -369,8 +446,9 @@ async function main() {
         ...normalizedObjects,
       ];
       present = new Set(boundingBoxes.map((b) => b.tag));
+      const isPointing = poseCheck(posedHands);
 
-      const hit = pointingHit(fingers, boundingBoxes, MAX_D);
+      const hit = pointingHit(hands, boundingBoxes, MAX_D);
       if (hit) {
         globalHit = hit.tag;
       }

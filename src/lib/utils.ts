@@ -1,4 +1,4 @@
-import type { Region, Finger, Box, Found } from "../main";
+import type { Region, Hand, Box, Found } from "../main";
 const M = 12;
 const THRESHOLD = 25;
 
@@ -42,7 +42,7 @@ export function toIndex(
 
 function shadowCounting(
   regions: Region[],
-  fingers: Finger[],
+  hand: Hand[],
   ctx: CanvasRenderingContext2D,
 ) {
   for (const r of regions) {
@@ -60,12 +60,12 @@ function shadowCounting(
       }
     }
 
-    if (fingers.some(({ tip }) => !isOutside(tip, outer)))
+    if (hand.some(({ tip }) => !isOutside(tip, outer)))
       r.baseline = getMedian(values);
     const cutoff = (r.baseline ?? getMedian(values)) * 0.8;
 
-    for (const finger of fingers) {
-      const { tip, joint } = finger;
+    for (const h of hand) {
+      const { tip, joint } = h;
       const tx = Math.round(tip.x);
       const ty = Math.round(tip.y);
       const jx = Math.round(joint.x);
@@ -89,7 +89,7 @@ function shadowCounting(
     ctx.font = "20px Arial";
     ctx.fillStyle = "black";
     ctx.fillText(`${shadowCount}`, r.x, r.y - 10);
-    const inside = fingers.some(({ tip }) => isInside(tip, r));
+    const inside = hand.some(({ tip }) => isInside(tip, r));
     if (inside) {
       ctx.strokeStyle = "green";
     } else ctx.strokeStyle = "red";
